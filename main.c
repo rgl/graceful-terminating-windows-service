@@ -28,7 +28,7 @@
 * POSSIBILITY OF SUCH DAMAGE.
 */
 
-#define _WIN32_WINNT 0x0600
+#define _WIN32_WINNT 0x0600 // Windows Server 2008+
 #define WINVER _WIN32_WINNT
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -37,6 +37,12 @@
 #include <stdarg.h>
 #include <time.h>
 #include <io.h>
+#ifndef SERVICE_CONTROL_PRESHUTDOWN
+#define SERVICE_CONTROL_PRESHUTDOWN 0x0000000F
+#endif
+#ifndef SERVICE_ACCEPT_PRESHUTDOWN
+#define SERVICE_ACCEPT_PRESHUTDOWN 0x00000100
+#endif
 
 void LOG(const char *format, ...) {
     time_t t;
@@ -59,38 +65,53 @@ void LOG(const char *format, ...) {
 
 HANDLE g_stopEvent = NULL;
 HANDLE g_serviceControlHandlerHandle = NULL;
+BOOL g_registerOnPreShutdown = FALSE; // register to receive SERVICE_CONTROL_PRESHUTDOWN or SERVICE_CONTROL_SHUTDOWN (default).
 int g_n = 10;
 
-VOID WINAPI serviceControlHandler(DWORD dwCtrl) {
+DWORD signalStop() {
+    SERVICE_STATUS serviceStatus = {
+        .dwServiceType = SERVICE_WIN32_OWN_PROCESS,
+        .dwCurrentState = SERVICE_STOP_PENDING,
+    };
+    if (!SetServiceStatus(g_serviceControlHandlerHandle, &serviceStatus)) {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        LOG("ERROR: Failed to SetServiceStatus Stop Pending with HREAULT 0x%x", hr);
+        return ERROR_CALL_NOT_IMPLEMENTED;
+    }
+    SetEvent(g_stopEvent);
+    return NO_ERROR;
+}
+
+// see HandlerEx callback function at https://msdn.microsoft.com/en-us/library/windows/desktop/ms683241(v=vs.85).aspx
+DWORD WINAPI serviceControlHandler(DWORD dwCtrl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext) {
     switch (dwCtrl) {
+        case SERVICE_CONTROL_PRESHUTDOWN:
+            LOG("serviceControlHandler SERVICE_CONTROL_PRESHUTDOWN");
+            return signalStop();
+
+        case SERVICE_CONTROL_SHUTDOWN:
+            LOG("serviceControlHandler SERVICE_CONTROL_SHUTDOWN");
+            return signalStop();
+
         case SERVICE_CONTROL_STOP:
             LOG("serviceControlHandler SERVICE_CONTROL_STOP");
-            SERVICE_STATUS serviceStatus = {
-                .dwServiceType = SERVICE_WIN32_OWN_PROCESS,
-                .dwCurrentState = SERVICE_STOP_PENDING,
-            };
-            if (!SetServiceStatus(g_serviceControlHandlerHandle, &serviceStatus)) {
-                HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
-                LOG("ERROR: Failed to SetServiceStatus Stop Pending with HREAULT 0x%x", hr);
-                return;
-            }
-            SetEvent(g_stopEvent);
-            return;
+            return signalStop();
 
         case SERVICE_CONTROL_INTERROGATE:
             LOG("serviceControlHandler SERVICE_CONTROL_INTERROGATE");
-            break;
+            return NO_ERROR;
 
         default:
             LOG("serviceControlHandler 0x%x", dwCtrl);
-            break;
+            return ERROR_CALL_NOT_IMPLEMENTED;
     }
 }
 
 VOID WINAPI serviceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
-    g_serviceControlHandlerHandle = RegisterServiceCtrlHandler(
+    g_serviceControlHandlerHandle = RegisterServiceCtrlHandlerEx(
         L"graceful-terminating-windows-service",
-        serviceControlHandler);
+        serviceControlHandler,
+        NULL);
     if (!g_serviceControlHandlerHandle) {
         HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
         LOG("ERROR: Failed to RegisterServiceCtrlHandler with HREAULT 0x%x", hr);
@@ -100,7 +121,7 @@ VOID WINAPI serviceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     SERVICE_STATUS serviceStatus = {
         .dwServiceType = SERVICE_WIN32_OWN_PROCESS,
         .dwCurrentState = SERVICE_RUNNING,
-        .dwControlsAccepted = SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_STOP,
+        .dwControlsAccepted = (g_registerOnPreShutdown ? SERVICE_ACCEPT_PRESHUTDOWN : SERVICE_ACCEPT_SHUTDOWN) | SERVICE_ACCEPT_STOP,
     };
     if (!SetServiceStatus(g_serviceControlHandlerHandle, &serviceStatus)) {
         HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
@@ -146,6 +167,9 @@ int wmain(int argc, wchar_t *argv[]) {
             return 9;
         }
     }
+    if (argc >= 4) {
+        g_registerOnPreShutdown = wcscmp(argv[3], L"t") == 0;
+    }
 
     LOG("Running (pid=%d)...", GetCurrentProcessId());
 
@@ -159,7 +183,7 @@ int wmain(int argc, wchar_t *argv[]) {
         LOG("ERROR: Failed to create stop event with HRESULT 0x%x", hr);
         goto cleanup;
     }
-    
+
     SERVICE_TABLE_ENTRY serviceTable[] = {
         { L"graceful-terminating-windows-service", (LPSERVICE_MAIN_FUNCTION)serviceMain },
         { NULL, NULL }
